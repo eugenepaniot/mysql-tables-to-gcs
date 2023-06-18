@@ -1,0 +1,51 @@
+---
+project_name: mysql-backup-tables-to-gcs
+
+release:
+  mode: replace
+  replace_existing_draft: true
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+
+    goarch:
+      - amd64
+      - arm
+      - arm64
+
+    # List of combinations of GOOS + GOARCH + GOARM to ignore.
+    ignore:
+      - goos: darwin
+        goarch: 386
+      - goos: linux
+        goarch: arm
+        goarm: 7
+      - goarm: mips64
+      - gomips: hardfloat
+      - goamd64: v4
+
+archives:
+  - replacements:
+      darwin: Darwin
+      linux: Linux
+      amd64: x86_64
+
+checksum:
+  name_template: 'checksums.txt'
+
+nfpms:
+- file_name_template: "{{ .ConventionalFileName }}"
+  vendor: Eugene Paniot
+  maintainer: Eugene Paniot <e.paniot@gmail.com>
+  homepage: https://github.com/eugenepaniot/mysql-tables-to-gcs
+  description: |-
+    The Mysql Database Backup Tool is a command-line application written in Go that allows you to backup MySQL databases and store the backups directly to Google Cloud Storage. It supports concurrent backup of multiple databases and tables, improving backup efficiency and performance.
+
+  formats:
+    - apk
+    - deb
+    - rpm
