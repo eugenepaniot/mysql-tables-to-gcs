@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
 	"io"
@@ -15,8 +14,8 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	_ "github.com/go-sql-driver/mysql"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/api/option"
 )
 
 const (
@@ -38,7 +37,7 @@ func main() {
 	flag.StringVar(&dbPass, "dbPass", "", "MySQL database password")
 	flag.StringVar(&dbHost, "dbHost", "localhost", "MySQL database host")
 	flag.StringVar(&dbPort, "dbPort", "3306", "MySQL database port")
-	flag.StringVar(&bucketName, "bucketName", "", "Google Cloud Storage bucket name")
+	flag.StringVar(&bucketName, "bucketName", "", "GCS bucket name")
 	flag.UintVar(&dbLimit, "dbLimit", 2, "DB backup concurrency limit")
 	flag.UintVar(&tableLimit, "tableLimit", 2, "Table backup concurrency limit")
 	flag.StringVar(&skipDBs, "skipDBs", "information_schema,performance_schema,test", "Comma-separated list of databases to skip")
@@ -54,19 +53,28 @@ func main() {
 		log.Fatalf("Failed to get hostname: %v", err)
 	}
 
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/", dbUser, dbPass, dbHost, dbPort))
-	if err != nil {
-		log.Fatalf("Failed to connect to MySQL: %v", err)
-	}
-	defer db.Close()
-
-	databases, err := getDatabases(db, skipDBs)
+	databases, err := getDatabases(&dbUser, &dbPass, &dbHost, &dbPort, &skipDBs)
 	if err != nil {
 		log.Fatalf("Failed to retrieve list of databases: %v", err)
 	}
 
+	options := []option.ClientOption{
+		option.WithScopes("https://www.googleapis.com/auth/devstorage.read_write"),
+		option.WithGRPCConnectionPool(int(dbLimit * tableLimit)),
+		option.WithUserAgent("mysql-backup-tables-to-gcs"),
+		option.WithTelemetryDisabled(),
+	}
+
 	ctx := context.Background()
-	dbGroup, ctx := errgroup.WithContext(ctx)
+	client, err := storage.NewClient(ctx, options...)
+	if err != nil {
+		log.Fatalf("failed to create GCS client: %w", err)
+	}
+	defer client.Close()
+
+	bucket := client.Bucket(bucketName)
+
+	dbGroup := new(errgroup.Group)
 	dbGroup.SetLimit(int(dbLimit))
 
 	for _, database := range databases {
@@ -75,19 +83,19 @@ func main() {
 		dbGroup.Go(func() error {
 			log.Printf("Backing up database: %s\n", database)
 
-			tables, err := getTables(db, database)
+			tables, err := getTables(&dbUser, &dbPass, &dbHost, &dbPort, &database)
 			if err != nil {
 				return fmt.Errorf("failed to retrieve list of tables for database %s: %w", database, err)
 			}
 
-			tableGroup, _ := errgroup.WithContext(ctx)
+			tableGroup := new(errgroup.Group)
 			tableGroup.SetLimit(int(tableLimit))
 
 			for _, table := range tables {
 				table := table
 
 				tableGroup.Go(func() error {
-					backupPath := fmt.Sprintf("%s/%s/%s", hostname, database, time.Now().Format("2006-01-02-15"))
+					backupPath := fmt.Sprintf("%s/%s/%s", hostname, time.Now().Format("2006-01-02-15"), database)
 
 					log.Printf("Backing up table: %s\n", table)
 
@@ -118,8 +126,8 @@ func main() {
 						return fmt.Errorf("failed to start mysqldump command: %w", err)
 					}
 
-					if err := uploadToGCS(ctx, bucketName, backupPath, table, output); err != nil {
-						return fmt.Errorf("failed to upload backup for table %s to Google Cloud Storage: %w", table, err)
+					if err := uploadToGCS(ctx, bucket, &backupPath, &table, output); err != nil {
+						return fmt.Errorf("failed to upload backup for table \"%s\" to GCS: %w", table, err)
 					}
 
 					if err := cmd.Wait(); err != nil {
@@ -150,80 +158,98 @@ func main() {
 	log.Println("Database backup completed")
 }
 
-func getDatabases(db *sql.DB, skipDBs string) ([]string, error) {
-	rows, err := db.Query("SHOW DATABASES")
+func getDatabases(dbUser *string, dbPass *string, dbHost *string, dbPort *string, skipDBs *string) ([]string, error) {
+	cmd := exec.Command("mysql",
+		"--user="+*dbUser,
+		"--password="+*dbPass,
+		"--host="+*dbHost,
+		"--port="+*dbPort,
+		"-e", "SHOW DATABASES",
+	)
+
+	output, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to execute mysql command: %w", err)
 	}
-	defer rows.Close()
 
 	var databases []string
-	skipDBList := strings.Split(skipDBs, ",")
-	for rows.Next() {
-		var database string
-		if err := rows.Scan(&database); err != nil {
-			return nil, err
-		}
-		if !contains(skipDBList, database) {
+	skipDBList := strings.Split(*skipDBs, ",")
+
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	for scanner.Scan() {
+		database := scanner.Text()
+		if !contains(&skipDBList, &database) {
 			databases = append(databases, database)
 		}
 	}
 
-	return databases, nil
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read output from mysql command: %w", err)
+	}
 
+	return databases, nil
 }
 
-func getTables(db *sql.DB, database string) ([]string, error) {
-	rows, err := db.Query(fmt.Sprintf("SHOW TABLES FROM `%s`", database))
+func getTables(dbUser *string, dbPass *string, dbHost *string, dbPort *string, database *string) ([]string, error) {
+	cmd := exec.Command("mysql",
+		"--user="+*dbUser,
+		"--password="+*dbPass,
+		"--host="+*dbHost,
+		"--port="+*dbPort,
+		"-e", fmt.Sprintf("SHOW TABLES FROM `%s`", *database),
+	)
+
+	output, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to execute mysql command: %w", err)
 	}
-	defer rows.Close()
 
 	var tables []string
-	for rows.Next() {
-		var table string
-		if err := rows.Scan(&table); err != nil {
-			return nil, err
-		}
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	for scanner.Scan() {
+		table := scanner.Text()
 		tables = append(tables, table)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read output from mysql command: %w", err)
 	}
 
 	return tables, nil
 }
 
-func uploadToGCS(ctx context.Context, bucketName, backupPath, table string, reader io.Reader) error {
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create Google Cloud Storage client: %w", err)
-	}
-	defer client.Close()
-
-	bucket := client.Bucket(bucketName)
-	object := bucket.Object(fmt.Sprintf("%s/%s.sql.gz", backupPath, table))
-
+func uploadToGCS(ctx context.Context, bucket *storage.BucketHandle, backupPath *string, table *string, reader io.Reader) error {
+	object := bucket.Object(fmt.Sprintf("%s/%s.sql.gz", *backupPath, *table))
 	writer := object.NewWriter(ctx)
-	defer writer.Close()
-
 	gzipWriter := gzip.NewWriter(writer)
-	defer gzipWriter.Close()
-
 	bufWriter := bufio.NewWriterSize(gzipWriter, chunkSize)
 
 	if _, err := io.Copy(bufWriter, reader); err != nil {
-		return fmt.Errorf("failed to upload backup for table %s to Google Cloud Storage: %w", table, err)
+		return fmt.Errorf("failed to upload backup for table \"%s\" to GCS: %w", *table, err)
 	}
 
 	if err := bufWriter.Flush(); err != nil {
-		return fmt.Errorf("failed to flush data to Google Cloud Storage: %w", err)
+		return fmt.Errorf("failed to close bufWriter: %w", err)
+	}
+
+	if err := gzipWriter.Close(); err != nil {
+		return fmt.Errorf("failed to close gzipWriter: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to close writer: %w", err)
+	}
+
+	if _, err := object.Attrs(ctx); err != nil {
+		return fmt.Errorf("failed to retrieve attributes for GCS object: %w", err)
 	}
 
 	return nil
 }
 
-func contains(slice []string, value string) bool {
-	for _, item := range slice {
-		if item == value {
+func contains(slice *[]string, value *string) bool {
+	for _, item := range *slice {
+		if item == *value {
 			return true
 		}
 	}
