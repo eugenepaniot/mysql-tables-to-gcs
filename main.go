@@ -97,7 +97,7 @@ func main() {
 				tableGroup.Go(func() error {
 					backupPath := fmt.Sprintf("%s/%s/%s", hostname, time.Now().Format("2006-01-02-15"), database)
 
-					log.Printf("Backing up table: %s\n", table)
+					log.Printf("Backing up table: \"%s.%s\"\n", database, table)
 
 					cmd := exec.Command("mysqldump",
 						fmt.Sprintf("--user=%s", dbUser),
@@ -127,14 +127,14 @@ func main() {
 					}
 
 					if err := uploadToGCS(ctx, bucket, &backupPath, &table, output); err != nil {
-						return fmt.Errorf("failed to upload backup for table \"%s\" to GCS: %w", table, err)
+						return fmt.Errorf("failed to upload backup for table \"%s.%s\" to GCS: %w", database, table, err)
 					}
 
 					if err := cmd.Wait(); err != nil {
 						return fmt.Errorf("failed to wait for mysqldump command: %w", err)
 					}
 
-					log.Printf("Backup for table %s completed.\n", table)
+					log.Printf("Backup for table \"%s.%s\" completed.\n", database, table)
 
 					return nil
 				})
@@ -164,6 +164,7 @@ func getDatabases(dbUser *string, dbPass *string, dbHost *string, dbPort *string
 		"--password="+*dbPass,
 		"--host="+*dbHost,
 		"--port="+*dbPort,
+		"--skip-column-names",
 		"-e", "SHOW DATABASES",
 	)
 
@@ -196,6 +197,7 @@ func getTables(dbUser *string, dbPass *string, dbHost *string, dbPort *string, d
 		"--password="+*dbPass,
 		"--host="+*dbHost,
 		"--port="+*dbPort,
+		"--skip-column-names",
 		"-e", fmt.Sprintf("SHOW TABLES FROM `%s`", *database),
 	)
 
