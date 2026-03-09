@@ -1,12 +1,10 @@
 module github.com/eugenepaniot/mysql-tables-to-gcs
 
-go 1.24.0
-
-toolchain go1.24.1
+go 1.25.0
 
 require (
 	cloud.google.com/go/storage v1.57.2
-	golang.org/x/sync v0.18.0
+	golang.org/x/sync v0.20.0
 	google.golang.org/api v0.252.0
 )
 
